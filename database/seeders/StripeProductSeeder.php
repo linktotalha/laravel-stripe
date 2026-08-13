@@ -3,6 +3,8 @@
 namespace Database\Seeders;
 
 use App\Models\Plan;
+use App\Models\Product;
+use App\Models\Price;
 use Illuminate\Database\Console\Seeds\WithoutModelEvents;
 use Illuminate\Database\Seeder;
 use Stripe\StripeClient;
@@ -13,127 +15,320 @@ class StripeProductSeeder extends Seeder
     /**
      * Run the database seeds.
      */
+    // public function run(): void
+    // {
+    //     $stripe = new StripeClient(
+    //         config('services.stripe.secret')
+    //     );
+
+    //     $plans = [
+    //         [
+    //             'name' => 'Basic Plan',
+    //             'description' => 'Basic monthly subscription',
+    //             'amount' => 1000,
+    //             'currency' => 'usd',
+    //             'interval' => 'month',
+    //         ],
+
+    //         [
+    //             'name' => 'Pro Plan',
+    //             'description' => 'Professional monthly subscription',
+    //             'amount' => 2500,
+    //             'currency' => 'usd',
+    //             'interval' => 'month',
+    //         ],
+
+    //         [
+    //             'name' => 'Premium Plan',
+    //             'description' => 'Premium monthly subscription',
+    //             'amount' => 5000,
+    //             'currency' => 'usd',
+    //             'interval' => 'month',
+    //         ],
+    //     ];
+
+    //     foreach ($plans as $planData) {
+
+    //         /*
+    //         |--------------------------------------------------------------------------
+    //         | 1. Create Stripe Product
+    //         |--------------------------------------------------------------------------
+    //         */
+
+    //         $product = $stripe->products->create([
+    //             'name' => $planData['name'],
+
+    //             'description' =>
+    //                 $planData['description'],
+
+    //             'active' => true,
+    //         ]);
+
+    //         /*
+    //         |--------------------------------------------------------------------------
+    //         | 2. Create Stripe Price
+    //         |--------------------------------------------------------------------------
+    //         */
+
+    //         $price = $stripe->prices->create([
+    //             'product' => $product->id,
+
+    //             'unit_amount' =>
+    //                 $planData['amount'],
+
+    //             'currency' =>
+    //                 $planData['currency'],
+
+    //             'recurring' => [
+    //                 'interval' =>
+    //                     $planData['interval'],
+    //             ],
+    //         ]);
+
+    //         /*
+    //         |--------------------------------------------------------------------------
+    //         | 3. Save Product + Price in Local Database
+    //         |--------------------------------------------------------------------------
+    //         */
+
+    //         $plan = Plan::create([
+    //             'name' =>
+    //                 $planData['name'],
+
+    //             'description' =>
+    //                 $planData['description'],
+
+    //             'stripe_product_id' =>
+    //                 $product->id,
+
+    //             'stripe_price_id' =>
+    //                 $price->id,
+
+    //             'amount' =>
+    //                 $planData['amount'],
+
+    //             'currency' =>
+    //                 $planData['currency'],
+
+    //             'interval' =>
+    //                 $planData['interval'],
+
+    //             'active' => true,
+    //         ]);
+
+    //         /*
+    //         |--------------------------------------------------------------------------
+    //         | Console Output
+    //         |--------------------------------------------------------------------------
+    //         */
+
+    //         $this->command->info(
+    //             "Plan created: {$plan->name}"
+    //         );
+
+    //         $this->command->info(
+    //             "Local Plan ID: {$plan->id}"
+    //         );
+
+    //         $this->command->info(
+    //             "Stripe Product: {$product->id}"
+    //         );
+
+    //         $this->command->info(
+    //             "Stripe Price: {$price->id}"
+    //         );
+
+    //         $this->command->newLine();
+    //     }
+    // }
+
     public function run(): void
     {
         $stripe = new StripeClient(
             config('services.stripe.secret')
         );
 
-        $plans = [
+        $products = [
+
             [
                 'name' => 'Basic Plan',
-                'description' => 'Basic monthly subscription',
-                'amount' => 1000,
-                'currency' => 'usd',
-                'interval' => 'month',
+
+                'description' =>
+                    'Basic subscription plan',
+
+                'prices' => [
+
+                    [
+                        'amount' => 1000,
+                        'currency' => 'usd',
+                        'interval' => 'month',
+                        'interval_count' => 1,
+                    ],
+
+                    [
+                        'amount' => 10000,
+                        'currency' => 'usd',
+                        'interval' => 'year',
+                        'interval_count' => 1,
+                    ],
+                ],
             ],
 
             [
                 'name' => 'Pro Plan',
-                'description' => 'Professional monthly subscription',
-                'amount' => 2500,
-                'currency' => 'usd',
-                'interval' => 'month',
+
+                'description' =>
+                    'Professional subscription plan',
+
+                'prices' => [
+
+                    [
+                        'amount' => 2500,
+                        'currency' => 'usd',
+                        'interval' => 'month',
+                        'interval_count' => 1,
+                    ],
+
+                    [
+                        'amount' => 25000,
+                        'currency' => 'usd',
+                        'interval' => 'year',
+                        'interval_count' => 1,
+                    ],
+                ],
             ],
 
             [
                 'name' => 'Premium Plan',
-                'description' => 'Premium monthly subscription',
-                'amount' => 5000,
-                'currency' => 'usd',
-                'interval' => 'month',
+
+                'description' =>
+                    'Premium subscription plan',
+
+                'prices' => [
+
+                    [
+                        'amount' => 5000,
+                        'currency' => 'usd',
+                        'interval' => 'month',
+                        'interval_count' => 1,
+                    ],
+
+                    [
+                        'amount' => 50000,
+                        'currency' => 'usd',
+                        'interval' => 'year',
+                        'interval_count' => 1,
+                    ],
+                ],
             ],
         ];
 
-        foreach ($plans as $planData) {
+        foreach ($products as $productData) {
 
             /*
             |--------------------------------------------------------------------------
-            | 1. Create Stripe Product
+            | Create Stripe Product
             |--------------------------------------------------------------------------
             */
 
-            $product = $stripe->products->create([
-                'name' => $planData['name'],
+            $stripeProduct = $stripe->products->create([
+                'name' =>
+                    $productData['name'],
 
                 'description' =>
-                    $planData['description'],
+                    $productData['description'],
 
                 'active' => true,
             ]);
 
             /*
             |--------------------------------------------------------------------------
-            | 2. Create Stripe Price
+            | Save Product Locally
             |--------------------------------------------------------------------------
             */
 
-            $price = $stripe->prices->create([
-                'product' => $product->id,
-
-                'unit_amount' =>
-                    $planData['amount'],
-
-                'currency' =>
-                    $planData['currency'],
-
-                'recurring' => [
-                    'interval' =>
-                        $planData['interval'],
-                ],
-            ]);
-
-            /*
-            |--------------------------------------------------------------------------
-            | 3. Save Product + Price in Local Database
-            |--------------------------------------------------------------------------
-            */
-
-            $plan = Plan::create([
+            $product = Product::create([
                 'name' =>
-                    $planData['name'],
+                    $productData['name'],
 
                 'description' =>
-                    $planData['description'],
+                    $productData['description'],
 
                 'stripe_product_id' =>
-                    $product->id,
-
-                'stripe_price_id' =>
-                    $price->id,
-
-                'amount' =>
-                    $planData['amount'],
-
-                'currency' =>
-                    $planData['currency'],
-
-                'interval' =>
-                    $planData['interval'],
+                    $stripeProduct->id,
 
                 'active' => true,
             ]);
 
             /*
             |--------------------------------------------------------------------------
-            | Console Output
+            | Create Multiple Stripe Prices
             |--------------------------------------------------------------------------
             */
 
-            $this->command->info(
-                "Plan created: {$plan->name}"
-            );
+            foreach (
+                $productData['prices']
+                as $priceData
+            ) {
+
+                $stripePrice =
+                    $stripe->prices->create([
+
+                        'product' =>
+                            $stripeProduct->id,
+
+                        'unit_amount' =>
+                            $priceData['amount'],
+
+                        'currency' =>
+                            $priceData['currency'],
+
+                        'recurring' => [
+
+                            'interval' =>
+                                $priceData['interval'],
+
+                            'interval_count' =>
+                                $priceData['interval_count'],
+                        ],
+                    ]);
+
+                /*
+                |--------------------------------------------------------------------------
+                | Save Price Locally
+                |--------------------------------------------------------------------------
+                */
+
+                Price::create([
+
+                    'product_id' =>
+                        $product->id,
+
+                    'stripe_price_id' =>
+                        $stripePrice->id,
+
+                    'amount' =>
+                        $priceData['amount'],
+
+                    'currency' =>
+                        $priceData['currency'],
+
+                    'interval' =>
+                        $priceData['interval'],
+
+                    'interval_count' =>
+                        $priceData['interval_count'],
+
+                    'active' => true,
+                ]);
+
+                $this->command->info(
+                    "Created Price: {$stripePrice->id}"
+                );
+            }
 
             $this->command->info(
-                "Local Plan ID: {$plan->id}"
-            );
-
-            $this->command->info(
-                "Stripe Product: {$product->id}"
-            );
-
-            $this->command->info(
-                "Stripe Price: {$price->id}"
+                "Created Product: {$stripeProduct->id}"
             );
 
             $this->command->newLine();
