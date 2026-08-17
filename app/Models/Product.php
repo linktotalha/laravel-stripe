@@ -8,18 +8,22 @@ use Illuminate\Database\Eloquent\Relations\HasMany;
 class Product extends Model
 {
     protected $fillable = [
-        'name',
-        'description',
-        'stripe_product_id',
-        'active',
+        'product_id', 'stripe_price_id', 'amount', 'currency',
+        'type', 'interval', 'interval_count', 'active',
     ];
 
     protected $casts = [
         'active' => 'boolean',
+        'amount' => 'integer',
     ];
 
-    public function prices(): HasMany
+    public function product()
     {
-        return $this->hasMany(Price::class);
+        return $this->belongsTo(Product::class);
+    }
+
+    public function subscriptions()
+    {
+        return $this->hasMany(Subscription::class);
     }
 }

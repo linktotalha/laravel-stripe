@@ -22,6 +22,16 @@ Route::middleware('auth:sanctum')->group(function () {
         [StripeCheckoutController::class, 'create']
     );
 
+    Route::get(
+        '/subscription/success',
+        [StripeCheckoutController::class, 'success']
+    )->name('subscription.success');
+
+    Route::get(
+        '/subscription/cancel',
+        [StripeCheckoutController::class, 'cancel']
+    )->name('subscription.cancel');
+
     Route::post('/logout', [AuthController::class, 'logout']);
 
 });

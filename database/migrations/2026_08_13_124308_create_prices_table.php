@@ -27,6 +27,9 @@ return new class extends Migration
 
             $table->string('currency', 3);
 
+            // 'recurring' or 'one_time'
+            $table->string('type')->default('recurring');
+
             $table->string('interval');
 
             $table->unsignedInteger('interval_count')

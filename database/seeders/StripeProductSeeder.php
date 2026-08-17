@@ -150,14 +150,27 @@ class StripeProductSeeder extends Seeder
 
         $products = [
 
+            /*
+            |--------------------------------------------------------------------------
+            | Basic Plan
+            |--------------------------------------------------------------------------
+            */
             [
                 'name' => 'Basic Plan',
 
-                'description' =>
-                    'Basic subscription plan',
+                'description' => 'Basic subscription plan',
 
                 'prices' => [
 
+                    // Daily
+                    [
+                        'amount' => 100,
+                        'currency' => 'usd',
+                        'interval' => 'day',
+                        'interval_count' => 1,
+                    ],
+
+                    // Monthly
                     [
                         'amount' => 1000,
                         'currency' => 'usd',
@@ -165,6 +178,7 @@ class StripeProductSeeder extends Seeder
                         'interval_count' => 1,
                     ],
 
+                    // Yearly
                     [
                         'amount' => 10000,
                         'currency' => 'usd',
@@ -174,14 +188,27 @@ class StripeProductSeeder extends Seeder
                 ],
             ],
 
+            /*
+            |--------------------------------------------------------------------------
+            | Pro Plan
+            |--------------------------------------------------------------------------
+            */
             [
                 'name' => 'Pro Plan',
 
-                'description' =>
-                    'Professional subscription plan',
+                'description' => 'Professional subscription plan',
 
                 'prices' => [
 
+                    // Daily
+                    [
+                        'amount' => 250,
+                        'currency' => 'usd',
+                        'interval' => 'day',
+                        'interval_count' => 1,
+                    ],
+
+                    // Monthly
                     [
                         'amount' => 2500,
                         'currency' => 'usd',
@@ -189,6 +216,7 @@ class StripeProductSeeder extends Seeder
                         'interval_count' => 1,
                     ],
 
+                    // Yearly
                     [
                         'amount' => 25000,
                         'currency' => 'usd',
@@ -198,14 +226,27 @@ class StripeProductSeeder extends Seeder
                 ],
             ],
 
+            /*
+            |--------------------------------------------------------------------------
+            | Premium Plan
+            |--------------------------------------------------------------------------
+            */
             [
                 'name' => 'Premium Plan',
 
-                'description' =>
-                    'Premium subscription plan',
+                'description' => 'Premium subscription plan',
 
                 'prices' => [
 
+                    // Daily
+                    [
+                        'amount' => 500,
+                        'currency' => 'usd',
+                        'interval' => 'day',
+                        'interval_count' => 1,
+                    ],
+
+                    // Monthly
                     [
                         'amount' => 5000,
                         'currency' => 'usd',
@@ -213,6 +254,7 @@ class StripeProductSeeder extends Seeder
                         'interval_count' => 1,
                     ],
 
+                    // Yearly
                     [
                         'amount' => 50000,
                         'currency' => 'usd',
@@ -223,20 +265,24 @@ class StripeProductSeeder extends Seeder
             ],
         ];
 
+        /*
+        |--------------------------------------------------------------------------
+        | Create Products & Prices
+        |--------------------------------------------------------------------------
+        */
+
         foreach ($products as $productData) {
 
             /*
             |--------------------------------------------------------------------------
-            | Create Stripe Product
+            | Create Product in Stripe
             |--------------------------------------------------------------------------
             */
 
             $stripeProduct = $stripe->products->create([
-                'name' =>
-                    $productData['name'],
+                'name' => $productData['name'],
 
-                'description' =>
-                    $productData['description'],
+                'description' => $productData['description'],
 
                 'active' => true,
             ]);
@@ -248,50 +294,44 @@ class StripeProductSeeder extends Seeder
             */
 
             $product = Product::create([
-                'name' =>
-                    $productData['name'],
+                'name' => $productData['name'],
 
-                'description' =>
-                    $productData['description'],
+                'description' => $productData['description'],
 
-                'stripe_product_id' =>
-                    $stripeProduct->id,
+                'stripe_product_id' => $stripeProduct->id,
 
                 'active' => true,
             ]);
 
             /*
             |--------------------------------------------------------------------------
-            | Create Multiple Stripe Prices
+            | Create Prices
             |--------------------------------------------------------------------------
             */
 
-            foreach (
-                $productData['prices']
-                as $priceData
-            ) {
+            foreach ($productData['prices'] as $priceData) {
 
-                $stripePrice =
-                    $stripe->prices->create([
+                /*
+                |--------------------------------------------------------------------------
+                | Create Price in Stripe
+                |--------------------------------------------------------------------------
+                */
 
-                        'product' =>
-                            $stripeProduct->id,
+                $stripePrice = $stripe->prices->create([
 
-                        'unit_amount' =>
-                            $priceData['amount'],
+                    'product' => $stripeProduct->id,
 
-                        'currency' =>
-                            $priceData['currency'],
+                    'unit_amount' => $priceData['amount'],
 
-                        'recurring' => [
+                    'currency' => $priceData['currency'],
 
-                            'interval' =>
-                                $priceData['interval'],
+                    'recurring' => [
+                        'interval' => $priceData['interval'],
 
-                            'interval_count' =>
-                                $priceData['interval_count'],
-                        ],
-                    ]);
+                        'interval_count' =>
+                            $priceData['interval_count'],
+                    ],
+                ]);
 
                 /*
                 |--------------------------------------------------------------------------
@@ -300,21 +340,15 @@ class StripeProductSeeder extends Seeder
                 */
 
                 Price::create([
+                    'product_id' => $product->id,
 
-                    'product_id' =>
-                        $product->id,
+                    'stripe_price_id' => $stripePrice->id,
 
-                    'stripe_price_id' =>
-                        $stripePrice->id,
+                    'amount' => $priceData['amount'],
 
-                    'amount' =>
-                        $priceData['amount'],
+                    'currency' => $priceData['currency'],
 
-                    'currency' =>
-                        $priceData['currency'],
-
-                    'interval' =>
-                        $priceData['interval'],
+                    'interval' => $priceData['interval'],
 
                     'interval_count' =>
                         $priceData['interval_count'],
