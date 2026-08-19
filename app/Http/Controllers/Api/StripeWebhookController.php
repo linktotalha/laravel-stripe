@@ -12,6 +12,7 @@ use Illuminate\Support\Facades\Log;
 use Stripe\Exception\SignatureVerificationException;
 use Stripe\Webhook;
 use Stripe\StripeClient;
+use Carbon\Carbon;
 
 class StripeWebhookController extends Controller
 {
@@ -65,6 +66,20 @@ class StripeWebhookController extends Controller
 
                 break;
 
+            case 'invoice.payment_failed':
+                $this->handleInvoicePaymentFailed(
+                    $event->data->object
+                );
+
+                break;
+
+            case 'invoice.paid':
+                $this->handleInvoicePaid(
+                    $event->data->object
+                );
+
+                break;
+
             // case 'invoice.paid':
             //     $this->handleInvoicePaid(
             //         $event->data->object
@@ -82,58 +97,6 @@ class StripeWebhookController extends Controller
             'received' => true,
         ]);
     }
-
-    // private function handleCheckoutCompleted($session)
-    // {
-    //     if ($session->mode !== 'subscription') {
-    //         return;
-    //     }
-
-    //     $stripeSubscriptionId = $session->subscription;
-
-    //     if (!$stripeSubscriptionId) {
-    //         Log::warning('Checkout completed without subscription', [
-    //             'session_id' => $session->id,
-    //         ]);
-
-    //         return;
-    //     }
-
-    //     $userId = $session->metadata->user_id ?? null;
-    //     $priceId = $session->metadata->price_id ?? null;
-
-    //     if (!$userId || !$priceId) {
-    //         Log::error('Checkout metadata missing', [
-    //             'session_id' => $session->id,
-    //         ]);
-
-    //         return;
-    //     }
-
-    //     $user = User::find($userId);
-    //     $price = Price::find($priceId);
-
-    //     if (!$user || !$price) {
-    //         Log::error('User or price not found', [
-    //             'user_id' => $userId,
-    //             'price_id' => $priceId,
-    //         ]);
-
-    //         return;
-    //     }
-
-    //     Subscription::updateOrCreate(
-    //         [
-    //             'stripe_subscription_id' => $stripeSubscriptionId,
-    //         ],
-    //         [
-    //             'user_id' => $user->id,
-    //             'price_id' => $price->id,
-    //             'stripe_checkout_session_id' => $session->id,
-    //             'status' => 'active',
-    //         ]
-    //     );
-    // }
 
     private function handleSubscriptionCreated($stripeSubscription)
     {
@@ -219,83 +182,100 @@ class StripeWebhookController extends Controller
         );
     }
 
-    // private function handleInvoicePaid($invoice)
-    // {
-    //     $stripeSubscriptionId =
-    //         $invoice->parent?->subscription_details?->subscription;
+    private function handleInvoicePaid($invoice)
+    {
+        $stripe = new StripeClient(
+            config('services.stripe.secret')
+        );
 
-    //     if (!$stripeSubscriptionId) {
-    //         Log::warning('Invoice does not contain subscription ID', [
-    //             'invoice_id' => $invoice->id,
-    //         ]);
+        if (!$invoice->subscription) {
+            return;
+        }
 
-    //         return;
-    //     }
+        $subscription = Subscription::where(
+            'stripe_subscription_id',
+            $invoice->subscription
+        )->first();
 
-    //     $subscription = Subscription::where(
-    //         'stripe_subscription_id',
-    //         $stripeSubscriptionId
-    //     )->first();
+        if (!$subscription) {
+            Log::warning('Local subscription not found', [
+                'stripe_subscription_id' => $invoice->subscription,
+                'stripe_invoice_id' => $invoice->id,
+            ]);
 
-    //     if (!$subscription) {
-    //         Log::warning('Subscription not found yet. Invoice will be retried.', [
-    //             'invoice_id' => $invoice->id,
-    //             'stripe_subscription_id' => $stripeSubscriptionId,
-    //         ]);
+            return;
+        }
 
-    //         // Important: don't save the invoice here.
-    //         // Throwing causes the webhook/job to fail and can be retried.
-    //         throw new \RuntimeException(
-    //             "Subscription {$stripeSubscriptionId} not found"
-    //         );
-    //     }
+        $stripeSubscription = $stripe->subscriptions->retrieve(
+            $invoice->subscription,
+            []
+        );
 
-    //     Invoice::updateOrCreate(
-    //         [
-    //             'stripe_invoice_id' => $invoice->id,
-    //         ],
-    //         [
-    //             'user_id' => $subscription->user_id,
-    //             'subscription_id' => $subscription->id,
+        // Update subscription
+        $subscription->update([
+            'status' => $stripeSubscription->status,
 
-    //             'stripe_customer_id' => $invoice->customer,
+            'current_period_start' => Carbon::createFromTimestamp(
+                $stripeSubscription->current_period_start
+            ),
 
-    //             'status' => $invoice->status,
+            'current_period_end' => Carbon::createFromTimestamp(
+                $stripeSubscription->current_period_end
+            ),
 
-    //             'amount_due' => $invoice->amount_due ?? 0,
-    //             'amount_paid' => $invoice->amount_paid ?? 0,
-    //             'amount_remaining' => $invoice->amount_remaining ?? 0,
+            'cancel_at_period_end' =>
+                $stripeSubscription->cancel_at_period_end,
+        ]);
 
-    //             'currency' => $invoice->currency,
+        // Create/update local invoice
+        Invoice::updateOrCreate(
+            [
+                'stripe_invoice_id' => $invoice->id,
+            ],
+            [
+                'user_id' => $subscription->user_id,
+                'subscription_id' => $subscription->id,
+                'stripe_customer_id' => $invoice->customer,
+                'status' => $invoice->status,
+                'amount' => $invoice->amount_paid,
+                'currency' => $invoice->currency,
+            ]
+        );
+    }
 
-    //             'invoice_created_at' =>
-    //                 $this->timestampToDate($invoice->created ?? null),
+    private function handleInvoicePaymentFailed($invoice)
+    {
+        if (!$invoice->subscription) {
+            return;
+        }
 
-    //             'due_date' =>
-    //                 $this->timestampToDate($invoice->due_date ?? null),
+        $subscription = Subscription::where(
+            'stripe_subscription_id',
+            $invoice->subscription
+        )->first();
 
-    //             'paid_at' =>
-    //                 $this->timestampToDate(
-    //                     $invoice->status_transitions?->paid_at
-    //                 ),
+        if (!$subscription) {
+            return;
+        }
 
-    //             'hosted_invoice_url' =>
-    //                 $invoice->hosted_invoice_url,
+        $subscription->update([
+            'status' => 'past_due',
+        ]);
 
-    //             'invoice_pdf' =>
-    //                 $invoice->invoice_pdf,
-
-    //             'metadata' =>
-    //                 $invoice->toArray(),
-    //         ]
-    //     );
-
-    //     Log::info('Invoice saved successfully', [
-    //         'invoice_id' => $invoice->id,
-    //         'subscription_id' => $subscription->id,
-    //         'stripe_subscription_id' => $stripeSubscriptionId,
-    //     ]);
-    // }
+        Invoice::updateOrCreate(
+            [
+                'stripe_invoice_id' => $invoice->id,
+            ],
+            [
+                'user_id' => $subscription->user_id,
+                'subscription_id' => $subscription->id,
+                'stripe_customer_id' => $invoice->customer,
+                'status' => $invoice->status,
+                'amount' => $invoice->amount_due,
+                'currency' => $invoice->currency,
+            ]
+        );
+    }
 
     private function timestampToDate($timestamp)
     {
