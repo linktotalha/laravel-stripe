@@ -38,7 +38,23 @@ return [
     'stripe' => [
         'key' => env('STRIPE_KEY'),
         'secret' => env('STRIPE_SECRET'),
-        'webhook_secret' => env('STRIPE_WEBHOOK_SECRET')
+        'webhook_secret' => env('STRIPE_WEBHOOK_SECRET'),
+
+        /*
+        | Stripe redirects the browser to these, so they must be frontend pages
+        | -- not API routes behind auth:sanctum, which a redirect cannot satisfy.
+        | The success page reads session_id from the query string and calls
+        | GET /api/subscription/success with the user's token.
+        */
+        'success_url' => env(
+            'STRIPE_SUCCESS_URL',
+            env('FRONTEND_URL', env('APP_URL')) . '/subscription/success'
+        ),
+
+        'cancel_url' => env(
+            'STRIPE_CANCEL_URL',
+            env('FRONTEND_URL', env('APP_URL')) . '/subscription/cancel'
+        ),
     ],
 
 ];

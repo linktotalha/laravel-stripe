@@ -3,284 +3,206 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
-use App\Models\Price;
-use App\Models\Invoice;
+use App\Models\StripeEvent;
 use App\Models\Subscription;
-use App\Models\User;
+use App\Services\StripeSyncService;
 use Illuminate\Http\Request;
+use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Log;
+use Stripe\Checkout\Session as StripeCheckoutSession;
+use Stripe\Event;
 use Stripe\Exception\SignatureVerificationException;
-use Stripe\Webhook;
+use Stripe\Invoice as StripeInvoice;
 use Stripe\StripeClient;
-use Carbon\Carbon;
+use Stripe\Subscription as StripeSubscription;
+use Stripe\Webhook;
 
 class StripeWebhookController extends Controller
 {
+    public function __construct(
+        private readonly StripeClient $stripe,
+        private readonly StripeSyncService $sync,
+    ) {}
+
     public function handle(Request $request)
     {
         $payload = $request->getContent();
 
         $signature = $request->header('Stripe-Signature');
 
-        $webhookSecret = config('services.stripe.webhook_secret');
-
         try {
             $event = Webhook::constructEvent(
                 $payload,
                 $signature,
-                $webhookSecret
+                config('services.stripe.webhook_secret')
             );
         } catch (\UnexpectedValueException $e) {
             Log::error('Invalid Stripe webhook payload');
 
-            return response()->json([
-                'message' => 'Invalid payload',
-            ], 400);
+            return response()->json(['message' => 'Invalid payload'], 400);
         } catch (SignatureVerificationException $e) {
             Log::error('Invalid Stripe webhook signature');
 
-            return response()->json([
-                'message' => 'Invalid signature',
-            ], 400);
+            return response()->json(['message' => 'Invalid signature'], 400);
         }
 
+        // Never log the full event: it carries customer PII.
         Log::info('Stripe webhook received', [
-            'type' => $event->type,
             'id' => $event->id,
-            'event' => $event,
-            'data' => $event->data->object
+            'type' => $event->type,
         ]);
 
-        switch ($event->type) {
-            // case 'checkout.session.completed':
-            //     $this->handleCheckoutCompleted(
-            //         $event->data->object
-            //     );
+        /*
+        |--------------------------------------------------------------------------
+        | Idempotency
+        |--------------------------------------------------------------------------
+        |
+        | Stripe retries until it sees a 2xx, so the same event id can arrive
+        | more than once. The unique index on stripe_event_id makes the insert
+        | the lock: if it is already there and done, acknowledge and stop.
+        */
 
-            //     break;
-
-            case 'customer.subscription.created':
-                $this->handleSubscriptionCreated(
-                    $event->data->object
-                );
-
-                break;
-
-            case 'invoice.payment_failed':
-                $this->handleInvoicePaymentFailed(
-                    $event->data->object
-                );
-
-                break;
-
-            case 'invoice.paid':
-                $this->handleInvoicePaid(
-                    $event->data->object
-                );
-
-                break;
-
-            // case 'invoice.paid':
-            //     $this->handleInvoicePaid(
-            //         $event->data->object
-            //     );
-            //     break;
-
-            // case 'invoice.payment_failed':
-            //     $this->handleInvoicePaymentFailed(
-            //         $event->data->object
-            //     );
-            //     break;
-        }
-
-        return response()->json([
-            'received' => true,
-        ]);
-    }
-
-    private function handleSubscriptionCreated($stripeSubscription)
-    {
-        $userId = $stripeSubscription->metadata->user_id ?? null;
-        $priceId = $stripeSubscription->metadata->price_id ?? null;
-
-        if (!$userId || !$priceId) {
-            Log::error('Subscription metadata missing', [
-                'subscription_id' => $stripeSubscription->id,
-            ]);
-
-            return;
-        }
-
-        $user = User::find($userId);
-        $price = Price::find($priceId);
-
-        if (!$user || !$price) {
-            return;
-        }
-
-        $subscriptionItem = $stripeSubscription->items->data[0] ?? null;
-
-        if (!$subscriptionItem) {
-            Log::error('Subscription item not found', [
-                'subscription_id' => $stripeSubscription->id,
-            ]);
-
-            return;
-        }
-
-        $currentPeriodStart = $subscriptionItem->current_period_start ?? null;
-        $currentPeriodEnd = $subscriptionItem->current_period_end ?? null;
-
-        Subscription::updateOrCreate(
+        $record = StripeEvent::firstOrCreate(
+            ['stripe_event_id' => $event->id],
             [
-                'stripe_subscription_id' =>
-                    $stripeSubscription->id,
-            ],
-            [
-                'user_id' => $user->id,
-                'price_id' => $price->id,
-
-                'status' =>
-                    $stripeSubscription->status,
-
-                'current_period_start' =>
-                    $this->timestampToDate(
-                        $currentPeriodStart
-                    ),
-
-                'current_period_end' =>
-                    $this->timestampToDate(
-                        $currentPeriodEnd
-                    ),
-
-                'trial_start' =>
-                    $this->timestampToDate(
-                        $stripeSubscription->trial_start ?? null
-                    ),
-
-                'trial_end' =>
-                    $this->timestampToDate(
-                        $stripeSubscription->trial_end ?? null
-                    ),
-
-                'cancel_at_period_end' =>
-                    (bool) ($stripeSubscription->cancel_at_period_end ?? false),
-
-                'canceled_at' =>
-                    $this->timestampToDate(
-                        $stripeSubscription->canceled_at ?? null
-                    ),
-
-                'ended_at' =>
-                    $this->timestampToDate(
-                        $stripeSubscription->ended_at ?? null
-                    ),
-
-                'metadata' =>
-                    $stripeSubscription->toArray(),
+                'type' => $event->type,
+                'event_created_at' => Carbon::createFromTimestampUTC($event->created),
             ]
         );
-    }
 
-    private function handleInvoicePaid($invoice)
-    {
-        $stripe = new StripeClient(
-            config('services.stripe.secret')
-        );
-
-        if (!$invoice->subscription) {
-            return;
-        }
-
-        $subscription = Subscription::where(
-            'stripe_subscription_id',
-            $invoice->subscription
-        )->first();
-
-        if (!$subscription) {
-            Log::warning('Local subscription not found', [
-                'stripe_subscription_id' => $invoice->subscription,
-                'stripe_invoice_id' => $invoice->id,
+        if ($record->processed_at) {
+            Log::info('Stripe webhook already processed, skipping', [
+                'id' => $event->id,
             ]);
 
-            return;
+            return response()->json(['received' => true, 'duplicate' => true]);
         }
 
-        $stripeSubscription = $stripe->subscriptions->retrieve(
-            $invoice->subscription,
-            []
-        );
+        /*
+        |--------------------------------------------------------------------------
+        | Dispatch
+        |--------------------------------------------------------------------------
+        |
+        | A handler failure is recorded and returned as a 500 so Stripe retries.
+        | Anything unexpected is acknowledged rather than retried forever.
+        */
 
-        // Update subscription
-        $subscription->update([
-            'status' => $stripeSubscription->status,
+        try {
+            $this->dispatchEvent($event);
 
-            'current_period_start' => Carbon::createFromTimestamp(
-                $stripeSubscription->current_period_start
-            ),
+            $record->update(['processed_at' => now(), 'error' => null]);
+        } catch (\Throwable $e) {
+            Log::error('Stripe webhook handler failed', [
+                'id' => $event->id,
+                'type' => $event->type,
+                'error' => $e->getMessage(),
+            ]);
 
-            'current_period_end' => Carbon::createFromTimestamp(
-                $stripeSubscription->current_period_end
-            ),
+            $record->update(['error' => $e->getMessage()]);
 
-            'cancel_at_period_end' =>
-                $stripeSubscription->cancel_at_period_end,
-        ]);
+            // 500 tells Stripe to retry with backoff.
+            return response()->json(['message' => 'Handler failed'], 500);
+        }
 
-        // Create/update local invoice
-        Invoice::updateOrCreate(
-            [
-                'stripe_invoice_id' => $invoice->id,
-            ],
-            [
-                'user_id' => $subscription->user_id,
-                'subscription_id' => $subscription->id,
-                'stripe_customer_id' => $invoice->customer,
-                'status' => $invoice->status,
-                'amount' => $invoice->amount_paid,
-                'currency' => $invoice->currency,
-            ]
-        );
+        return response()->json(['received' => true]);
     }
 
-    private function handleInvoicePaymentFailed($invoice)
+    private function dispatchEvent(Event $event): void
     {
-        if (!$invoice->subscription) {
-            return;
-        }
+        $object = $event->data->object;
 
-        $subscription = Subscription::where(
-            'stripe_subscription_id',
-            $invoice->subscription
-        )->first();
+        match ($event->type) {
+            'checkout.session.completed' => $this->handleCheckoutCompleted($object),
 
-        if (!$subscription) {
-            return;
-        }
+            // created / updated / deleted all carry a full subscription object,
+            // so one sync path covers activation, plan changes made in the
+            // Stripe dashboard or Customer Portal, dunning, and cancellation.
+            'customer.subscription.created',
+            'customer.subscription.updated',
+            'customer.subscription.deleted' => $this->handleSubscriptionChanged($object),
 
-        $subscription->update([
-            'status' => 'past_due',
-        ]);
+            'invoice.paid' => $this->handleInvoicePaid($object),
 
-        Invoice::updateOrCreate(
-            [
-                'stripe_invoice_id' => $invoice->id,
-            ],
-            [
-                'user_id' => $subscription->user_id,
-                'subscription_id' => $subscription->id,
-                'stripe_customer_id' => $invoice->customer,
-                'status' => $invoice->status,
-                'amount' => $invoice->amount_due,
-                'currency' => $invoice->currency,
-            ]
-        );
+            'invoice.payment_failed' => $this->handleInvoicePaymentFailed($object),
+
+            default => Log::info('Unhandled Stripe event type', [
+                'type' => $event->type,
+            ]),
+        };
     }
 
-    private function timestampToDate($timestamp)
+    /**
+     * Record the subscription as soon as checkout completes, and stamp the
+     * session id so the success endpoint can find it.
+     */
+    private function handleCheckoutCompleted(StripeCheckoutSession $session): void
     {
-        return $timestamp
-            ? now()->createFromTimestamp($timestamp)
-            : null;
+        if ($session->mode !== 'subscription' || ! $session->subscription) {
+            return;
+        }
+
+        $subscriptionId = is_string($session->subscription)
+            ? $session->subscription
+            : $session->subscription->id;
+
+        $stripeSubscription = $this->stripe->subscriptions->retrieve($subscriptionId);
+
+        $this->sync->syncSubscription($stripeSubscription, $session->id);
+    }
+
+    private function handleSubscriptionChanged(StripeSubscription $stripeSubscription): void
+    {
+        $this->sync->syncSubscription($stripeSubscription);
+    }
+
+    private function handleInvoicePaid(StripeInvoice $invoice): void
+    {
+        $subscription = $this->syncSubscriptionForInvoice($invoice);
+
+        if (! $subscription) {
+            return;
+        }
+
+        $this->sync->syncInvoice($invoice, $subscription);
+    }
+
+    private function handleInvoicePaymentFailed(StripeInvoice $invoice): void
+    {
+        // The real status comes from Stripe: a failed FIRST invoice leaves the
+        // subscription "incomplete", and exhausted retries give "canceled" or
+        // "unpaid" -- hardcoding "past_due" would be wrong in all three cases.
+        $subscription = $this->syncSubscriptionForInvoice($invoice);
+
+        if (! $subscription) {
+            return;
+        }
+
+        $this->sync->syncInvoice($invoice, $subscription);
+    }
+
+    /**
+     * Re-sync the subscription an invoice belongs to and return the local row.
+     */
+    private function syncSubscriptionForInvoice(StripeInvoice $invoice): ?Subscription
+    {
+        $subscriptionId = $this->sync->subscriptionIdFromInvoice($invoice);
+
+        if (! $subscriptionId) {
+            // One-off invoice, not tied to a subscription.
+            return null;
+        }
+
+        $stripeSubscription = $this->stripe->subscriptions->retrieve($subscriptionId);
+
+        $subscription = $this->sync->syncSubscription($stripeSubscription);
+
+        if (! $subscription) {
+            Log::warning('Local subscription not found for invoice', [
+                'stripe_subscription_id' => $subscriptionId,
+                'stripe_invoice_id' => $invoice->id,
+            ]);
+        }
+
+        return $subscription;
     }
 }

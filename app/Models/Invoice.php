@@ -26,6 +26,9 @@ class Invoice extends Model
     ];
 
     protected $casts = [
+        'amount_due' => 'integer',
+        'amount_paid' => 'integer',
+        'amount_remaining' => 'integer',
         'invoice_created_at' => 'datetime',
         'due_date' => 'datetime',
         'paid_at' => 'datetime',

@@ -25,13 +25,11 @@ return new class extends Migration
     public function down(): void
     {
         Schema::table('subscriptions', function (Blueprint $table) {
-            Schema::table('subscriptions', function (Blueprint $table) {
-                $table->dropUnique([
-                    'stripe_checkout_session_id',
-                ]);
+            $table->dropUnique([
+                'stripe_checkout_session_id',
+            ]);
 
-                $table->dropColumn('stripe_checkout_session_id');
-            });
+            $table->dropColumn('stripe_checkout_session_id');
         });
     }
 };

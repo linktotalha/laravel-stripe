@@ -2,361 +2,266 @@
 
 namespace App\Http\Controllers\Api;
 
-use App\Models\Price;
 use App\Http\Controllers\Controller;
-use Illuminate\Http\Request;
-use Stripe\StripeClient;
+use App\Models\Price;
 use App\Models\Subscription;
-use Illuminate\Support\Facades\DB;
+use App\Models\User;
+use App\Services\StripeSyncService;
+use Illuminate\Http\Request;
+use Illuminate\Validation\Rule;
 use Illuminate\Support\Facades\Log;
 use Stripe\Exception\ApiErrorException;
+use Stripe\StripeClient;
 
 class StripeCheckoutController extends Controller
 {
+    public function __construct(
+        private readonly StripeClient $stripe,
+        private readonly StripeSyncService $sync,
+    ) {}
+
+    /**
+     * Start a subscription checkout.
+     *
+     * price_id is the STRIPE price id ("price_..."), the same identifier used by
+     * changePlan below.
+     */
     public function create(Request $request)
     {
         $validated = $request->validate([
-            'price_id' => ['required', 'string'],
+            'price_id' => [
+                'required',
+                'string',
+                Rule::exists('prices', 'stripe_price_id')->where(
+                    fn ($query) => $query->where('active', true)
+                ),
+            ],
         ]);
 
         $user = $request->user();
 
-        $stripe = new StripeClient(
-            config('services.stripe.secret')
-        );
-
         /*
         |--------------------------------------------------------------------------
-        | Make sure customer exists
+        | One subscription per user
         |--------------------------------------------------------------------------
+        |
+        | Without this a double click creates two live subscriptions, and every
+        | later lookup then has to guess which one is "the" subscription.
         */
 
-        // $existingSubscription = Subscription::where('user_id', $user->id)
-        //     ->whereIn('status', [
-        //         'active',
-        //         'trialing',
-        //         'past_due',
-        //         'unpaid',
-        //     ])
-        //     ->first();
+        $existing = $this->sync->activeSubscriptionFor($user);
 
-        // if ($existingSubscription) {
-        //     return response()->json([
-        //         'message' => 'User already has an active subscription.',
-        //         'subscription' => $existingSubscription,
-        //     ], 409);
-        // }
+        if ($existing) {
+            return response()->json([
+                'message' => 'User already has an active subscription. Use change-plan instead.',
+                'subscription' => $this->presentSubscription($existing),
+            ], 409);
+        }
 
-        if (!$user->stripe_customer_id) {
+        $price = Price::where('stripe_price_id', $validated['price_id'])->firstOrFail();
 
-            $customer = $stripe->customers->create([
-                'email' => $user->email,
+        try {
+            $customerId = $this->ensureStripeCustomer($user);
 
-                'name' => $user->name,
+            $session = $this->stripe->checkout->sessions->create([
+                'customer' => $customerId,
+
+                'mode' => 'subscription',
+
+                'line_items' => [
+                    [
+                        'price' => $price->stripe_price_id,
+                        'quantity' => 1,
+                    ],
+                ],
+
+                // Stripe redirects the BROWSER here, so these must point at the
+                // frontend, not at token-protected API routes.
+                'success_url' => rtrim(config('services.stripe.success_url'), '/')
+                    . '?session_id={CHECKOUT_SESSION_ID}',
+
+                'cancel_url' => config('services.stripe.cancel_url'),
 
                 'metadata' => [
-                    'user_id' =>
-                        (string) $user->id,
+                    'user_id' => (string) $user->id,
+                    'price_id' => (string) $price->id,
+                ],
+
+                // Copied onto the subscription so the webhook can resolve the
+                // owner even before the customer id lookup is available.
+                'subscription_data' => [
+                    'metadata' => [
+                        'user_id' => (string) $user->id,
+                        'price_id' => (string) $price->id,
+                    ],
                 ],
             ]);
-
-            $user->update([
-                'stripe_customer_id' =>
-                    $customer->id,
+        } catch (ApiErrorException $e) {
+            return $this->stripeFailure('Unable to start checkout.', $e, [
+                'user_id' => $user->id,
+                'stripe_price_id' => $price->stripe_price_id,
             ]);
         }
 
-        $price = Price::where(
-            'stripe_price_id',
-            $validated['price_id']
-        )->firstOrFail();
-
-
-        /*
-        |--------------------------------------------------------------------------
-        | Create Checkout Session
-        |--------------------------------------------------------------------------
-        */
-
-        $session = $stripe->checkout->sessions->create([
-
-            'customer' =>
-                $user->stripe_customer_id,
-
-            'mode' => 'subscription',
-
-            'line_items' => [
-                [
-                    'price' =>
-                        $validated['price_id'],
-
-                    'quantity' => 1,
-                ],
-            ],
-
-            'success_url' =>
-                config('app.url')
-                . '/subscription/success'
-                . '?session_id={CHECKOUT_SESSION_ID}',
-
-            'cancel_url' =>
-                config('app.url')
-                . '/subscription/cancel',
-
-            'metadata' => [
-                'user_id' =>
-                    (string) $user->id,
-                'price_id' => (string) $price->id
-            ],
-            'subscription_data' => [
-                'metadata' => [
-                    'user_id' => (string) $user->id,
-                    'price_id' => (string) $price->id
-                ],
-            ],
-        ]);
-
         return response()->json([
-            'message' =>
-                'Checkout session created',
-
-            'checkout_session_id' =>
-                $session->id,
-
-            'checkout_url' =>
-                $session->url,
+            'message' => 'Checkout session created',
+            'checkout_session_id' => $session->id,
+            'checkout_url' => $session->url,
         ]);
     }
 
-    // public function success(Request $request)
-    // {
-    //     $request->validate([
-    //         'session_id' => ['required', 'string'],
-    //     ]);
-
-    //     $stripe = new StripeClient(
-    //         config('services.stripe.secret')
-    //     );
-
-    //     try {
-
-    //         /*
-    //         |--------------------------------------------------------------------------
-    //         | Retrieve Checkout Session
-    //         |--------------------------------------------------------------------------
-    //         */
-
-    //         $session = $stripe->checkout->sessions->retrieve(
-    //             $request->session_id,
-    //             [
-    //                 'expand' => [
-    //                     'subscription',
-    //                     'customer',
-    //                     'line_items.data.price.product',
-    //                 ],
-    //             ]
-    //         );
-
-    //         /*
-    //         |--------------------------------------------------------------------------
-    //         | Make sure this is a subscription checkout
-    //         |--------------------------------------------------------------------------
-    //         */
-
-    //         if ($session->mode !== 'subscription') {
-
-    //             return response()->json([
-    //                 'success' => false,
-    //                 'message' => 'This is not a subscription checkout session.',
-    //             ], 422);
-    //         }
-
-    //         /*
-    //         |--------------------------------------------------------------------------
-    //         | Get Subscription
-    //         |--------------------------------------------------------------------------
-    //         */
-
-    //         $stripeSubscription = $session->subscription;
-
-    //         /*
-    //         |--------------------------------------------------------------------------
-    //         | Find Local Subscription
-    //         |--------------------------------------------------------------------------
-    //         */
-
-    //         $localSubscription = Subscription::where(
-    //             'stripe_subscription_id',
-    //             $stripeSubscription->id
-    //         )->first();
-
-    //         return response()->json([
-    //             'success' => true,
-
-    //             'message' => 'Subscription checkout completed successfully.',
-
-    //             'data' => [
-
-    //                 'checkout_session' => [
-    //                     'id' => $session->id,
-
-    //                     'status' => $session->status,
-
-    //                     'payment_status' =>
-    //                         $session->payment_status,
-    //                 ],
-
-    //                 'customer' => [
-    //                     'id' => $session->customer->id,
-
-    //                     'email' =>
-    //                         $session->customer->email,
-    //                 ],
-
-    //                 'subscription' => [
-
-    //                     'stripe_subscription_id' =>
-    //                         $stripeSubscription->id,
-
-    //                     'status' =>
-    //                         $stripeSubscription->status,
-
-    //                     'current_period_start' =>
-    //                         $this->timestampToDate(
-    //                             $stripeSubscription->current_period_start
-    //                         ),
-
-    //                     'current_period_end' =>
-    //                         $this->timestampToDate(
-    //                             $stripeSubscription->current_period_end
-    //                         ),
-
-    //                     'cancel_at_period_end' =>
-    //                         $stripeSubscription->cancel_at_period_end,
-    //                 ],
-
-    //                 'local_subscription' =>
-    //                     $localSubscription,
-    //             ],
-    //         ]);
-
-    //     } catch (\Throwable $e) {
-
-    //         Log::error(
-    //             'Stripe success page error',
-    //             [
-    //                 'session_id' =>
-    //                     $request->session_id,
-
-    //                 'message' =>
-    //                     $e->getMessage(),
-    //             ]
-    //         );
-
-    //         return response()->json([
-    //             'success' => false,
-    //             'message' => 'Unable to retrieve checkout session.',
-    //         ], 500);
-    //     }
-    // }
-
-    public function changePlan(Request $request)
+    /**
+     * Confirm a completed checkout.
+     *
+     * The frontend success page calls this with the session_id from the URL.
+     * The subscription itself is persisted by the webhook; this only reports
+     * state back, so it stays correct even if the user closes the tab.
+     */
+    public function success(Request $request)
     {
-        $request->validate([
-            'price_id' => ['required', 'exists:prices,id'],
+        $validated = $request->validate([
+            'session_id' => ['required', 'string'],
         ]);
 
         $user = $request->user();
 
+        try {
+            $session = $this->stripe->checkout->sessions->retrieve(
+                $validated['session_id'],
+                ['expand' => ['subscription.items']]
+            );
+        } catch (ApiErrorException $e) {
+            return $this->stripeFailure('Unable to retrieve checkout session.', $e, [
+                'user_id' => $user->id,
+                'session_id' => $validated['session_id'],
+            ]);
+        }
+
         /*
         |--------------------------------------------------------------------------
-        | Get new price
+        | Authorization
         |--------------------------------------------------------------------------
+        |
+        | Session ids are guessable enough to be worth checking: only the
+        | customer the session belongs to may read it.
         */
 
-        $newPrice = Price::where('id', $request->price_id)
-            ->where('active', true)
-            ->firstOrFail();
+        $sessionCustomerId = is_string($session->customer)
+            ? $session->customer
+            : ($session->customer->id ?? null);
 
-        /*
-        |--------------------------------------------------------------------------
-        | Get current local subscription
-        |--------------------------------------------------------------------------
-        */
+        if (! $user->stripe_customer_id || $sessionCustomerId !== $user->stripe_customer_id) {
+            return response()->json([
+                'message' => 'This checkout session does not belong to the current user.',
+            ], 403);
+        }
 
-        $localSubscription = Subscription::where('user_id', $user->id)
-            ->whereIn('status', [
-                'active',
-                'trialing',
-                'past_due',
-            ])
-            ->first();
+        if ($session->mode !== 'subscription') {
+            return response()->json([
+                'message' => 'This is not a subscription checkout session.',
+            ], 422);
+        }
 
-        if (!$localSubscription) {
+        $stripeSubscription = $session->subscription;
+
+        // Payment may still be processing; the webhook will finish the job.
+        if (! $stripeSubscription) {
+            return response()->json([
+                'message' => 'Checkout completed but the subscription is not ready yet.',
+                'checkout_session' => [
+                    'id' => $session->id,
+                    'status' => $session->status,
+                    'payment_status' => $session->payment_status,
+                ],
+                'subscription' => null,
+            ], 202);
+        }
+
+        // Sync here too so the response is correct even if the webhook is
+        // still in flight. Both paths are idempotent.
+        $local = $this->sync->syncSubscription($stripeSubscription, $session->id);
+
+        return response()->json([
+            'message' => 'Subscription checkout completed successfully.',
+            'checkout_session' => [
+                'id' => $session->id,
+                'status' => $session->status,
+                'payment_status' => $session->payment_status,
+            ],
+            'subscription' => $local ? $this->presentSubscription($local) : null,
+        ]);
+    }
+
+    /**
+     * Show the caller's current subscription.
+     */
+    public function show(Request $request)
+    {
+        $subscription = $this->sync->activeSubscriptionFor($request->user());
+
+        if (! $subscription) {
+            return response()->json([
+                'message' => 'User does not have an active subscription.',
+                'subscription' => null,
+            ], 404);
+        }
+
+        return response()->json([
+            'subscription' => $this->presentSubscription($subscription),
+        ]);
+    }
+
+    /**
+     * Upgrade or downgrade the current subscription.
+     *
+     * price_id is the STRIPE price id ("price_..."), matching create() above.
+     */
+    public function changePlan(Request $request)
+    {
+        $validated = $request->validate([
+            'price_id' => [
+                'required',
+                'string',
+                Rule::exists('prices', 'stripe_price_id')->where(
+                    fn ($query) => $query->where('active', true)
+                ),
+            ],
+        ]);
+
+        $user = $request->user();
+
+        $newPrice = Price::where('stripe_price_id', $validated['price_id'])->firstOrFail();
+
+        $localSubscription = $this->sync->activeSubscriptionFor($user);
+
+        if (! $localSubscription) {
             return response()->json([
                 'message' => 'User does not have an active subscription.',
             ], 404);
         }
 
-        /*
-        |--------------------------------------------------------------------------
-        | Old price
-        |--------------------------------------------------------------------------
-        */
-
         $oldPriceId = $localSubscription->price_id;
 
-        if ($oldPriceId == $newPrice->id) {
+        if ((int) $oldPriceId === (int) $newPrice->id) {
             return response()->json([
                 'message' => 'User is already subscribed to this plan.',
             ], 422);
         }
 
-        /*
-        |--------------------------------------------------------------------------
-        | Stripe client
-        |--------------------------------------------------------------------------
-        */
-
-        $stripe = new StripeClient(
-            config('services.stripe.secret')
-        );
-
         try {
-
-            /*
-            |--------------------------------------------------------------------------
-            | Get Stripe subscription
-            |--------------------------------------------------------------------------
-            */
-
-            $stripeSubscription = $stripe->subscriptions->retrieve(
-                $localSubscription->stripe_subscription_id,
-                []
+            $stripeSubscription = $this->stripe->subscriptions->retrieve(
+                $localSubscription->stripe_subscription_id
             );
 
-            /*
-            |--------------------------------------------------------------------------
-            | Get current subscription item
-            |--------------------------------------------------------------------------
-            */
+            $subscriptionItem = $stripeSubscription->items->data[0] ?? null;
 
-            $subscriptionItem =
-                $stripeSubscription->items->data[0] ?? null;
-
-            if (!$subscriptionItem) {
+            if (! $subscriptionItem) {
                 return response()->json([
                     'message' => 'Stripe subscription item not found.',
                 ], 422);
             }
 
-            /*
-            |--------------------------------------------------------------------------
-            | Change price
-            |--------------------------------------------------------------------------
-            */
-
-            $updatedSubscription = $stripe->subscriptions->update(
+            $updatedSubscription = $this->stripe->subscriptions->update(
                 $stripeSubscription->id,
                 [
                     'items' => [
@@ -366,481 +271,174 @@ class StripeCheckoutController extends Controller
                         ],
                     ],
 
-                    /*
-                    |--------------------------------------------------------------------------
-                    | Upgrade / downgrade proration
-                    |--------------------------------------------------------------------------
-                    */
-
+                    // Bill the difference on the next invoice.
                     'proration_behavior' => 'create_prorations',
 
-                    /*
-                    |--------------------------------------------------------------------------
-                    | Stripe subscription metadata
-                    |--------------------------------------------------------------------------
-                    */
-
                     'metadata' => [
-                        'user_id' =>
-                            (string) $localSubscription->user_id,
-
-                        'local_subscription_id' =>
-                            (string) $localSubscription->id,
-
-                        'price_id' =>
-                            (string) $newPrice->id,
-
-                        'stripe_price_id' =>
-                            (string) $newPrice->stripe_price_id,
+                        'user_id' => (string) $localSubscription->user_id,
+                        'price_id' => (string) $newPrice->id,
                     ],
                 ]
             );
-
-            /*
-            |--------------------------------------------------------------------------
-            | Get UPDATED subscription item
-            |--------------------------------------------------------------------------
-            */
-
-            $updatedItem =
-                $updatedSubscription->items->data[0] ?? null;
-
-            if (!$updatedItem) {
-                return response()->json([
-                    'message' => 'Updated Stripe subscription item not found.',
-                ], 422);
-            }
-
-            /*
-            |--------------------------------------------------------------------------
-            | Stripe period values
-            |--------------------------------------------------------------------------
-            |
-            | According to your Stripe response:
-            |
-            | current_period_start
-            | current_period_end
-            |
-            | are inside the subscription item.
-            |
-            */
-
-            $periodStart = !empty($updatedItem->current_period_start)
-                ? date(
-                    'Y-m-d H:i:s',
-                    $updatedItem->current_period_start
-                )
-                : null;
-
-            $periodEnd = !empty($updatedItem->current_period_end)
-                ? date(
-                    'Y-m-d H:i:s',
-                    $updatedItem->current_period_end
-                )
-                : null;
-
-            /*
-            |--------------------------------------------------------------------------
-            | Update local database
-            |--------------------------------------------------------------------------
-            */
-
-            DB::transaction(function () use (
-                $localSubscription,
-                $newPrice,
-                $updatedSubscription,
-                $periodStart,
-                $periodEnd
-            ) {
-
-                $localSubscription->price_id = $newPrice->id;
-
-                $localSubscription->status =
-                    $updatedSubscription->status;
-
-                $localSubscription->current_period_start =
-                    $periodStart;
-
-                $localSubscription->current_period_end =
-                    $periodEnd;
-
-                $localSubscription->trial_start =
-                    !empty($updatedSubscription->trial_start)
-                        ? date(
-                            'Y-m-d H:i:s',
-                            $updatedSubscription->trial_start
-                        )
-                        : null;
-
-                $localSubscription->trial_end =
-                    !empty($updatedSubscription->trial_end)
-                        ? date(
-                            'Y-m-d H:i:s',
-                            $updatedSubscription->trial_end
-                        )
-                        : null;
-
-                $localSubscription->cancel_at_period_end =
-                    (bool) $updatedSubscription->cancel_at_period_end;
-
-                $localSubscription->canceled_at =
-                    !empty($updatedSubscription->canceled_at)
-                        ? date(
-                            'Y-m-d H:i:s',
-                            $updatedSubscription->canceled_at
-                        )
-                        : null;
-
-                $localSubscription->ended_at =
-                    !empty($updatedSubscription->ended_at)
-                        ? date(
-                            'Y-m-d H:i:s',
-                            $updatedSubscription->ended_at
-                        )
-                        : null;
-
-                /*
-                |--------------------------------------------------------------------------
-                | Store Stripe snapshot
-                |--------------------------------------------------------------------------
-                */
-
-                $localSubscription->metadata =
-                    $updatedSubscription->toArray();
-
-                /*
-                |--------------------------------------------------------------------------
-                | IMPORTANT: explicitly save
-                |--------------------------------------------------------------------------
-                */
-
-                $localSubscription->save();
-            });
-
-            /*
-            |--------------------------------------------------------------------------
-            | Reload from database
-            |--------------------------------------------------------------------------
-            */
-
-            $localSubscription->refresh();
-
-            /*
-            |--------------------------------------------------------------------------
-            | Log actual DB values
-            |--------------------------------------------------------------------------
-            */
-
-            Log::info('Local subscription saved after plan change', [
-                'subscription_id' =>
-                    $localSubscription->id,
-
-                'price_id' =>
-                    $localSubscription->price_id,
-
-                'status' =>
-                    $localSubscription->status,
-
-                'current_period_start' =>
-                    $localSubscription->current_period_start,
-
-                'current_period_end' =>
-                    $localSubscription->current_period_end,
-
-                'cancel_at_period_end' =>
-                    $localSubscription->cancel_at_period_end,
+        } catch (ApiErrorException $e) {
+            return $this->stripeFailure('Unable to change subscription plan.', $e, [
+                'user_id' => $user->id,
+                'stripe_subscription_id' => $localSubscription->stripe_subscription_id,
             ]);
-
-            /*
-            |--------------------------------------------------------------------------
-            | Response
-            |--------------------------------------------------------------------------
-            */
-
-            return response()->json([
-                'message' =>
-                    'Subscription plan changed successfully.',
-
-                'subscription' => [
-                    'id' =>
-                        $localSubscription->id,
-
-                    'old_price_id' =>
-                        $oldPriceId,
-
-                    'new_price_id' =>
-                        $localSubscription->price_id,
-
-                    'stripe_subscription_id' =>
-                        $updatedSubscription->id,
-
-                    'stripe_price_id' =>
-                        $updatedItem->price->id,
-
-                    'status' =>
-                        $localSubscription->status,
-
-                    'current_period_start' =>
-                        $localSubscription->current_period_start,
-
-                    'current_period_end' =>
-                        $localSubscription->current_period_end,
-
-                    'cancel_at_period_end' =>
-                        $localSubscription->cancel_at_period_end,
-
-                    'canceled_at' =>
-                        $localSubscription->canceled_at,
-
-                    'ended_at' =>
-                        $localSubscription->ended_at,
-                ],
-            ]);
-
-        } catch (\Stripe\Exception\ApiErrorException $e) {
-
-            Log::error('Stripe subscription update failed', [
-                'user_id' =>
-                    $user->id,
-
-                'stripe_subscription_id' =>
-                    $localSubscription->stripe_subscription_id,
-
-                'error' =>
-                    $e->getMessage(),
-            ]);
-
-            return response()->json([
-                'message' =>
-                    'Unable to change subscription plan.',
-
-                'error' =>
-                    $e->getMessage(),
-            ], 422);
         }
+
+        $localSubscription = $this->sync->syncSubscription($updatedSubscription)
+            ?? $localSubscription->refresh();
+
+        return response()->json([
+            'message' => 'Subscription plan changed successfully.',
+            'subscription' => $this->presentSubscription($localSubscription) + [
+                'old_price_id' => $oldPriceId,
+            ],
+        ]);
     }
 
+    /**
+     * Cancel at the end of the current billing period.
+     *
+     * The status stays "active" until Stripe actually ends it and sends
+     * customer.subscription.deleted.
+     */
     public function cancelSubscription(Request $request)
     {
         $user = $request->user();
 
-        /*
-        |--------------------------------------------------------------------------
-        | Find local subscription
-        |--------------------------------------------------------------------------
-        */
+        $localSubscription = $this->sync->activeSubscriptionFor($user);
 
-        $localSubscription = Subscription::where('user_id', $user->id)
-            ->whereIn('status', [
-                'active',
-                'trialing',
-                'past_due',
-            ])
-            ->first();
-
-        if (!$localSubscription) {
+        if (! $localSubscription) {
             return response()->json([
                 'message' => 'User does not have an active subscription.',
             ], 404);
         }
 
-        /*
-        |--------------------------------------------------------------------------
-        | Already scheduled for cancellation
-        |--------------------------------------------------------------------------
-        */
-
         if ($localSubscription->cancel_at_period_end) {
             return response()->json([
-                'message' =>
-                    'Subscription is already scheduled for cancellation.',
-
-                'subscription' => [
-                    'id' =>
-                        $localSubscription->id,
-
-                    'stripe_subscription_id' =>
-                        $localSubscription->stripe_subscription_id,
-
-                    'status' =>
-                        $localSubscription->status,
-
-                    'cancel_at_period_end' =>
-                        true,
-
-                    'current_period_end' =>
-                        $localSubscription->current_period_end,
-                ],
+                'message' => 'Subscription is already scheduled for cancellation.',
+                'subscription' => $this->presentSubscription($localSubscription),
             ], 422);
         }
-
-        /*
-        |--------------------------------------------------------------------------
-        | Stripe client
-        |--------------------------------------------------------------------------
-        */
-
-        $stripe = new StripeClient(
-            config('services.stripe.secret')
-        );
 
         try {
-
-            /*
-            |--------------------------------------------------------------------------
-            | Cancel subscription at period end
-            |--------------------------------------------------------------------------
-            */
-
-            $updatedSubscription = $stripe->subscriptions->update(
+            $updatedSubscription = $this->stripe->subscriptions->update(
                 $localSubscription->stripe_subscription_id,
-                [
-                    'cancel_at_period_end' => true,
-                ]
+                ['cancel_at_period_end' => true]
             );
-
-            /*
-            |--------------------------------------------------------------------------
-            | Get updated subscription item
-            |--------------------------------------------------------------------------
-            |
-            | In your Stripe response, current_period_start and
-            | current_period_end are available on the subscription item.
-            |
-            */
-
-            $subscriptionItem =
-                $updatedSubscription->items->data[0] ?? null;
-
-            /*
-            |--------------------------------------------------------------------------
-            | Current period end
-            |--------------------------------------------------------------------------
-            */
-
-            $currentPeriodEnd = null;
-
-            if (
-                $subscriptionItem &&
-                !empty($subscriptionItem->current_period_end)
-            ) {
-                $currentPeriodEnd = date(
-                    'Y-m-d H:i:s',
-                    $subscriptionItem->current_period_end
-                );
-            }
-
-            /*
-            |--------------------------------------------------------------------------
-            | Update local database
-            |--------------------------------------------------------------------------
-            */
-
-            DB::transaction(function () use (
-                $localSubscription,
-                $updatedSubscription,
-                $currentPeriodEnd
-            ) {
-
-                /*
-                | Do NOT change status to canceled here.
-                |
-                | The subscription is still active until the
-                | current billing period ends.
-                */
-
-                $localSubscription->status =
-                    $updatedSubscription->status;
-
-                $localSubscription->cancel_at_period_end =
-                    (bool) $updatedSubscription->cancel_at_period_end;
-
-                $localSubscription->current_period_end =
-                    $currentPeriodEnd;
-
-                $localSubscription->canceled_at =
-                    !empty($updatedSubscription->canceled_at)
-                        ? date(
-                            'Y-m-d H:i:s',
-                            $updatedSubscription->canceled_at
-                        )
-                        : null;
-
-                /*
-                |--------------------------------------------------------------------------
-                | Save Stripe response
-                |--------------------------------------------------------------------------
-                */
-
-                $localSubscription->metadata =
-                    $updatedSubscription->toArray();
-
-                $localSubscription->save();
-            });
-
-            /*
-            |--------------------------------------------------------------------------
-            | Reload from database
-            |--------------------------------------------------------------------------
-            */
-
-            $localSubscription->refresh();
-
-            /*
-            |--------------------------------------------------------------------------
-            | Response
-            |--------------------------------------------------------------------------
-            */
-
-            return response()->json([
-                'message' =>
-                    'Subscription will be canceled at the end of the current billing period.',
-
-                'subscription' => [
-
-                    'id' =>
-                        $localSubscription->id,
-
-                    'stripe_subscription_id' =>
-                        $localSubscription->stripe_subscription_id,
-
-                    'status' =>
-                        $localSubscription->status,
-
-                    'cancel_at_period_end' =>
-                        $localSubscription->cancel_at_period_end,
-
-                    'canceled_at' =>
-                        $localSubscription->canceled_at,
-
-                    'current_period_end' =>
-                        $localSubscription->current_period_end,
-                ],
+        } catch (ApiErrorException $e) {
+            return $this->stripeFailure('Unable to cancel subscription.', $e, [
+                'user_id' => $user->id,
+                'stripe_subscription_id' => $localSubscription->stripe_subscription_id,
             ]);
+        }
 
-        } catch (\Stripe\Exception\ApiErrorException $e) {
+        $localSubscription = $this->sync->syncSubscription($updatedSubscription)
+            ?? $localSubscription->refresh();
 
-            Log::error('Stripe subscription cancellation failed', [
-                'user_id' =>
-                    $user->id,
+        return response()->json([
+            'message' => 'Subscription will be canceled at the end of the current billing period.',
+            'subscription' => $this->presentSubscription($localSubscription),
+        ]);
+    }
 
-                'local_subscription_id' =>
-                    $localSubscription->id,
+    /**
+     * Undo a scheduled cancellation while the period is still running.
+     */
+    public function resumeSubscription(Request $request)
+    {
+        $user = $request->user();
 
-                'stripe_subscription_id' =>
-                    $localSubscription->stripe_subscription_id,
+        $localSubscription = $this->sync->activeSubscriptionFor($user);
 
-                'error' =>
-                    $e->getMessage(),
-            ]);
-
+        if (! $localSubscription) {
             return response()->json([
-                'message' =>
-                    'Unable to cancel subscription.',
+                'message' => 'User does not have an active subscription.',
+            ], 404);
+        }
 
-                'error' =>
-                    $e->getMessage(),
+        if (! $localSubscription->cancel_at_period_end) {
+            return response()->json([
+                'message' => 'Subscription is not scheduled for cancellation.',
+                'subscription' => $this->presentSubscription($localSubscription),
             ], 422);
         }
+
+        try {
+            $updatedSubscription = $this->stripe->subscriptions->update(
+                $localSubscription->stripe_subscription_id,
+                ['cancel_at_period_end' => false]
+            );
+        } catch (ApiErrorException $e) {
+            return $this->stripeFailure('Unable to resume subscription.', $e, [
+                'user_id' => $user->id,
+                'stripe_subscription_id' => $localSubscription->stripe_subscription_id,
+            ]);
+        }
+
+        $localSubscription = $this->sync->syncSubscription($updatedSubscription)
+            ?? $localSubscription->refresh();
+
+        return response()->json([
+            'message' => 'Subscription resumed.',
+            'subscription' => $this->presentSubscription($localSubscription),
+        ]);
+    }
+
+    /**
+     * Create the Stripe customer on first use and remember it.
+     */
+    private function ensureStripeCustomer(User $user): string
+    {
+        if ($user->stripe_customer_id) {
+            return $user->stripe_customer_id;
+        }
+
+        $customer = $this->stripe->customers->create([
+            'email' => $user->email,
+            'name' => $user->name,
+            'metadata' => [
+                'user_id' => (string) $user->id,
+            ],
+        ]);
+
+        $user->update(['stripe_customer_id' => $customer->id]);
+
+        return $customer->id;
+    }
+
+    private function presentSubscription(Subscription $subscription): array
+    {
+        $subscription->loadMissing('price');
+
+        return [
+            'id' => $subscription->id,
+            'stripe_subscription_id' => $subscription->stripe_subscription_id,
+            'price_id' => $subscription->price_id,
+            'stripe_price_id' => $subscription->price?->stripe_price_id,
+            'status' => $subscription->status,
+            'current_period_start' => $subscription->current_period_start,
+            'current_period_end' => $subscription->current_period_end,
+            'trial_start' => $subscription->trial_start,
+            'trial_end' => $subscription->trial_end,
+            'cancel_at_period_end' => $subscription->cancel_at_period_end,
+            'canceled_at' => $subscription->canceled_at,
+            'ended_at' => $subscription->ended_at,
+        ];
+    }
+
+    /**
+     * Log the Stripe error, return a generic message.
+     *
+     * Stripe messages can name internal ids and account configuration, so they
+     * do not belong in an API response.
+     */
+    private function stripeFailure(string $message, ApiErrorException $e, array $context)
+    {
+        Log::error($message, $context + ['error' => $e->getMessage()]);
+
+        return response()->json(['message' => $message], 422);
     }
 }

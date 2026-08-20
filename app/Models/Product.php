@@ -4,26 +4,33 @@ namespace App\Models;
 
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\HasMany;
+use Illuminate\Database\Eloquent\Relations\HasManyThrough;
 
 class Product extends Model
 {
+    /**
+     * These must match the products table. The previous list was copied from
+     * Price, so name/description/stripe_product_id were silently dropped on
+     * mass assignment and the insert failed on the NOT NULL name column.
+     */
     protected $fillable = [
-        'product_id', 'stripe_price_id', 'amount', 'currency',
-        'type', 'interval', 'interval_count', 'active',
+        'name',
+        'description',
+        'stripe_product_id',
+        'active',
     ];
 
     protected $casts = [
         'active' => 'boolean',
-        'amount' => 'integer',
     ];
 
-    public function product()
+    public function prices(): HasMany
     {
-        return $this->belongsTo(Product::class);
+        return $this->hasMany(Price::class);
     }
 
-    public function subscriptions()
+    public function subscriptions(): HasManyThrough
     {
-        return $this->hasMany(Subscription::class);
+        return $this->hasManyThrough(Subscription::class, Price::class);
     }
 }
